@@ -4,6 +4,7 @@
 
 GapProof is an AI-powered career readiness tool for students and recent graduates. Upload your CV and a target job description — GapProof audits the match, highlights exactly which lines of your CV are working for you (and which are hurting you), computes a transparent match score you can actually inspect, and turns every skill gap into a buildable weekend project.
 
+**▶ Live app:** [https://gapproofcv.streamlit.app/](https://gapproofcv.streamlit.app/)
 
 > Built with Streamlit + Groq (`openai/gpt-oss-20b`, with an automatic fallback model). Runs free-tier end to end.
 
