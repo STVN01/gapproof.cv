@@ -475,9 +475,17 @@ with st.sidebar:
         st.rerun()
 
 # ─── API KEY (main area, not the narrow rail) ───────────────────────────
-if "GROQ_API_KEY" in st.secrets:
-    api_key = st.secrets["GROQ_API_KEY"]
-else:
+def read_secret(name):
+    # st.secrets raises an error (not just "missing") when there is no
+    # secrets file at all — e.g. running locally. try/except turns that
+    # into a plain None so the app falls back to the input box instead.
+    try:
+        return st.secrets[name]
+    except Exception:
+        return None
+
+api_key = read_secret("GROQ_API_KEY")
+if not api_key:
     st.markdown(
         f"<div class='callout'>🔑 <b>Groq API key required.</b> "
         f"Get a free key at console.groq.com/keys, then paste it below.</div>",
@@ -491,6 +499,136 @@ if not api_key:
 # Create the Groq "phone line" — a connection object we'll use to send prompts.
 # Think of it like opening a phone app before making a call.
 client = Groq(api_key=api_key)
+
+# ─── AI SETTINGS — change models in ONE place ───────────────────────────
+# Every AI call in the app goes through ask_ai() below. When Groq retires
+# a model (it happened to llama-3.1-8b-instant), you edit ONE line here
+# instead of hunting through five separate calls.
+PRIMARY_MODEL  = "openai/gpt-oss-20b"       # reasoning model, strict JSON support
+FALLBACK_MODEL = "llama-3.3-70b-versatile"  # non-reasoning backup if the primary fails
+
+
+class AIError(Exception):
+    """An AI failure, already rewritten as a plain-English message."""
+
+
+def explain_error(err):
+    # Turn raw API errors into a sentence the user can act on.
+    status = getattr(err, "status_code", None)
+    text = str(err)
+    if status == 401:
+        return "Groq rejected the API key. Check GROQ_API_KEY in your secrets."
+    if status == 429:
+        return "Groq's free-tier rate limit was reached. Wait a minute and try again."
+    if "model_not_found" in text or "decommissioned" in text:
+        return "That AI model has been retired by Groq. Update PRIMARY_MODEL in app.py."
+    if "json_validate_failed" in text:
+        return "The AI couldn't produce a valid answer this time. Please try again."
+    return f"The AI request failed: {text[:300]}"
+
+
+def ask_ai(prompt, *, temperature=0.3, max_tokens=4096, json_schema=None):
+    """Send one prompt to Groq and return the reply text.
+
+    Tries PRIMARY_MODEL first, then FALLBACK_MODEL, so one retired or
+    overloaded model doesn't take the whole app down.
+    """
+    last_err = None
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        is_reasoning = model.startswith("openai/gpt-oss")
+        kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            # THE BUG FIX: without this, Groq's default limit is 1,024 tokens.
+            # Reasoning models spend that budget "thinking", run out before
+            # writing the answer, and return an EMPTY reply — which is exactly
+            # the json_validate_failed / failed_generation '' error.
+            "max_completion_tokens": max_tokens,
+        }
+        if is_reasoning:
+            kwargs["reasoning_effort"] = "low"    # think briefly, answer fully
+            kwargs["include_reasoning"] = False   # we only need the answer
+        if json_schema is not None:
+            if is_reasoning:
+                # Strict schema = constrained decoding: the model physically
+                # cannot emit JSON that breaks the shape we define below.
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "cv_audit", "strict": True,
+                                    "schema": json_schema},
+                }
+            else:
+                kwargs["response_format"] = {"type": "json_object"}
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return text
+            last_err = AIError(f"{model} returned an empty reply")
+        except Exception as e:
+            last_err = e
+    raise AIError(explain_error(last_err))
+
+
+def ask_ai_or_stop(prompt, **kwargs):
+    # For the free-text tools: show a friendly error and stop this run.
+    try:
+        return ask_ai(prompt, **kwargs)
+    except AIError as e:
+        st.error(f"❌ {e}")
+        st.stop()
+
+
+def parse_json(text):
+    # Normal case: the reply is pure JSON. Fallback: cut out the outermost
+    # {...} in case a model wrapped it in a sentence or code fence.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}") + 1
+        return json.loads(text[start:end])
+
+
+# The exact shape the Résumé Auditor must return. Strict mode requires
+# every field listed in "required" and no extra fields.
+_STR_LIST = {"type": "array", "items": {"type": "string"}}
+_RUBRIC_KEYS = ["technical_skills", "experience_relevance",
+                "education_fit", "evidence_quality"]
+AUDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rubric": {
+            "type": "object",
+            "properties": {k: {"type": "integer"} for k in _RUBRIC_KEYS},
+            "required": _RUBRIC_KEYS,
+            "additionalProperties": False,
+        },
+        "verdict": {"type": "string"},
+        "critical_issues": _STR_LIST,
+        "warning_issues": _STR_LIST,
+        "good_points": _STR_LIST,
+        "ats_keywords_found": _STR_LIST,
+        "ats_keywords_missing": _STR_LIST,
+        "skill_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"skill": {"type": "string"},
+                               "percent": {"type": "integer"}},
+                "required": ["skill", "percent"],
+                "additionalProperties": False,
+            },
+        },
+        "strong_phrases": _STR_LIST,
+        "weak_phrases": _STR_LIST,
+        "cv_comment": {"type": "string"},
+    },
+    "required": ["rubric", "verdict", "critical_issues", "warning_issues",
+                 "good_points", "ats_keywords_found", "ats_keywords_missing",
+                 "skill_coverage", "strong_phrases", "weak_phrases", "cv_comment"],
+    "additionalProperties": False,
+}
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -605,9 +743,6 @@ Return this exact JSON structure:
     "evidence_quality":     <0-10: quantified, verifiable achievements>
   }},
   "verdict": "<one of: Strong Match | Good Fit | Needs Work | Poor Fit>",
-  "critical_count": <integer>,
-  "warning_count": <integer>,
-  "good_count": <integer>,
   "critical_issues": ["<specific issue>", "<specific issue>"],
   "warning_issues": ["<specific issue>", "<specific issue>"],
   "good_points": ["<specific strength>", "<specific strength>"],
@@ -643,28 +778,21 @@ Job Description:
             # Analogy: like faxing a questionnaire and getting back a filled form.
 
             try:
-                completion = client.chat.completions.create(
-                    model="openai/gpt-oss-20b",    # Fast, capable Llama model
-                    messages=[{
-                        "role": "user",
-                        "content": system_prompt      # Our detailed instruction
-                    }],
-                    temperature=0.1,                  # Low = more consistent, less random
-                    response_format={"type": "json_object"}  # Force JSON output
-                )
-
-                # ── STEP 4: Extract the response text ────────────────────
-                # FIX: Old code used completion.choices.message.content (WRONG)
-                # choices is a LIST — you need [0] to get the first (and only) item.
-                # Analogy: choices is a box of letters, [0] picks the first letter out.
-
-                raw_output = completion.choices[0].message.content.strip()
+                # ask_ai() handles the model choice, the token budget, strict
+                # JSON and the fallback model. 8,000 tokens leaves room for a
+                # long CV's worth of phrases plus the model's reasoning.
+                raw_output = ask_ai(system_prompt, temperature=0.1,
+                                    max_tokens=8000, json_schema=AUDIT_SCHEMA)
 
                 # ── STEP 5: Parse JSON into a Python dictionary ───────────
-                # json.loads() converts a JSON string into a Python dict.
-                # Analogy: converting a written list into a filing cabinet you can search.
+                # Analogy: converting a written form into a filing cabinet.
+                data = parse_json(raw_output)
 
-                data = json.loads(raw_output)
+                # Counts come from the lists themselves, so the badges can
+                # never disagree with the tabs ("3 Critical" but 2 listed).
+                data["critical_count"] = len(data.get("critical_issues", []))
+                data["warning_count"]  = len(data.get("warning_issues", []))
+                data["good_count"]     = len(data.get("good_points", []))
 
                 # ── SCORE COMPUTED IN PYTHON, NOT BY THE AI ────────────
                 # WHY: a single LLM-invented "78" is unexplainable and
@@ -695,14 +823,13 @@ Job Description:
                 st.session_state.cv_full = extracted_text
                 st.session_state.audit_data = data
 
-            except json.JSONDecodeError:
-                # Groq returned something that wasn't valid JSON
-                st.error("❌ AI returned invalid data. Please try again.")
+            except AIError as e:
+                # Already a plain-English message from explain_error()
+                st.error(f"❌ {e}")
                 st.stop()
 
-            except Exception as e:
-                # Any other error (network, API key, etc.)
-                st.error(f"❌ API Error: {e}")
+            except (json.JSONDecodeError, ValueError, TypeError):
+                st.error("❌ The AI's answer couldn't be read. Please run the audit again.")
                 st.stop()
 
     # ── DISPLAY RESULTS ──────────────────────────────────────────────────
@@ -987,15 +1114,8 @@ Include:
 Do NOT include pleasantries. Output raw Markdown only.
 """
 
-                blueprint_resp = client.chat.completions.create(
-                    model="openai/gpt-oss-20b",
-                    messages=[{"role": "user", "content": architect_prompt}],
-                    temperature=0.3
-                )
-
-                # FIX: .choices[0].message.content (NOT .choices.message.content)
-                # Old code was missing [0] — choices is a list
-                blueprint_text = blueprint_resp.choices[0].message.content.strip()
+                blueprint_text = ask_ai_or_stop(architect_prompt, temperature=0.3,
+                                                max_tokens=6000)
 
             st.subheader("Your GitHub README Blueprint")
             # text_area so the user can copy the Markdown easily
@@ -1056,14 +1176,8 @@ For each question, include:
 Format as a numbered list. Be direct and realistic — these should feel like real interview questions.
 """
 
-                    q_resp = client.chat.completions.create(
-                        model="openai/gpt-oss-20b",
-                        messages=[{"role": "user", "content": interview_prompt}],
-                        temperature=0.4
-                    )
-
-                    # FIX: choices[0] not choices
-                    questions_text = q_resp.choices[0].message.content.strip()
+                    questions_text = ask_ai_or_stop(interview_prompt, temperature=0.4,
+                                                    max_tokens=4096)
 
                 st.markdown(questions_text)
 
@@ -1110,14 +1224,8 @@ Provide:
 Be concise and direct. Format with clear headings.
 """
 
-                eval_resp = client.chat.completions.create(
-                    model="openai/gpt-oss-20b",
-                    messages=[{"role": "user", "content": eval_prompt}],
-                    temperature=0.1
-                )
-
-                # FIX: choices[0] not choices
-                feedback = eval_resp.choices[0].message.content.strip()
+                feedback = ask_ai_or_stop(eval_prompt, temperature=0.1,
+                                          max_tokens=4096)
 
             st.subheader("🏁 Code Review Feedback")
             st.markdown(feedback)
@@ -1174,14 +1282,7 @@ Format as a Markdown table with columns: Week | Focus Skill | Resource | Hours |
 Then add a 'What success looks like' section at the end.
 """
 
-                plan_resp = client.chat.completions.create(
-                    model="openai/gpt-oss-20b",
-                    messages=[{"role": "user", "content": plan_prompt}],
-                    temperature=0.3
-                )
-
-                # FIX: choices[0] not choices
-                plan_text = plan_resp.choices[0].message.content.strip()
+                plan_text = ask_ai_or_stop(plan_prompt, temperature=0.3,
+                                           max_tokens=6000)
 
             st.markdown(plan_text)
-

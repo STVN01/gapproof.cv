@@ -1,0 +1,11 @@
+# Secrets — never commit API keys
+.streamlit/secrets.toml
+.env
+
+# Python clutter
+__pycache__/
+*.pyc
+
+# Colab working files that should never reach the repo (CVs, PDFs)
+*.pdf
+sample_data/
